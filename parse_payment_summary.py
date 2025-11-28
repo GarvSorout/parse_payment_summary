@@ -247,6 +247,9 @@ def clean_provider_name_raw(cand: str) -> str:
 		return ""
 	# Limit to first 4 tokens to avoid trailing noise
 	tokens = tokens[:4]
+	# Drop trailing single-letter artifacts (e.g., stray 'C' from header bleed)
+	while len(tokens) >= 2 and len(tokens[-1]) == 1:
+		tokens.pop()
 	# Title-case with 'Mc' handling
 	def fix_case(t: str) -> str:
 		if len(t) >= 3 and t[:2].lower() == "mc":
