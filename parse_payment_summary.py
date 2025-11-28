@@ -111,6 +111,7 @@ _NUM_RE = re.compile(r"(-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?)")
 _ONLY_SC_RE = re.compile(r"^[scSC]{2,}$")
 _WORD_RE = re.compile(r"^[A-Za-z][A-Za-z\-']*$")
 _META_TOKENS = ("REPORT", "RUN DATE", "PAGE:", "GROUP #", "REMITTANCE", "FOR PERIOD", "OHIP PAYMENT SUMMARY")
+_TOTAL_ROW_TOKENS = ("GROUP PAYMENTS TO PROVIDER TOTAL", "PROVIDER SUMMARY TOTAL", "PROVIDERS SUMMARY TOTAL")
 
 # Canonical category names (uppercased), with simple normalization to match common OCR variants
 _CATEGORY_CANON = {
@@ -319,6 +320,8 @@ def parse_provider_page(page_text: str) -> tuple[str, list[tuple[str, float, flo
 		# Skip meta/noise
 		if any(k in cat.upper() for k in ("REPORT:", "GROUP #", "RUN DATE", "PAGE:", "BROOKLIN MEDICAL CENTRE", "OHIP PAYMENT SUMMARY", "FOR PERIOD", "REMITTANCE")):
 			continue
+		if any(tok in cat.upper() for tok in _TOTAL_ROW_TOKENS):
+			continue
 		rows.append((cat, cur, ytd))
 	return provider, rows
 
@@ -381,7 +384,7 @@ def write_provider_csvs_from_entries(provider_entries: List[dict], out_dir: Path
 				total_ytd = sum(r[2] for r in rows)
 			for cat, cur, ytd in rows:
 				# Skip meta categories defensively
-				if any(tok in cat.upper() for tok in _META_TOKENS):
+				if any(tok in cat.upper() for tok in _META_TOKENS) or any(tok in cat.upper() for tok in _TOTAL_ROW_TOKENS):
 					continue
 				wcat.writerow([name, provider_id or "", cat, f"{cur:.2f}", f"{ytd:.2f}"])
 			wtot.writerow([name, provider_id or "", f"{total_cur:.2f}", f"{total_ytd:.2f}"])
@@ -1114,7 +1117,7 @@ def write_provider_payments_csv(meta: dict, provider_entries: List[dict], pages_
 			ohip = p.get("id") or ""
 			for cat, cur, ytd in p["rows"]:
 				# Skip meta categories
-				if any(tok in cat.upper() for tok in _META_TOKENS):
+				if any(tok in cat.upper() for tok in _META_TOKENS) or any(tok in cat.upper() for tok in _TOTAL_ROW_TOKENS):
 					continue
 				w.writerow([group_num, period, ab_date or "", f"{(ab_amount or 0.0):.2f}", ohip, name, cat, f"{cur:.2f}", f"{ytd:.2f}", "GROUP PAYMENTS TO PROVIDER"])
 		# Next, decoded PROVIDER SUMMARY pages
@@ -1249,8 +1252,12 @@ def main() -> None:
 				rows: List[Tuple[str, float, float]] = []
 				for ln in pages_ocr[i].splitlines():
 					cat, cur, ytd = line_to_category_and_numbers(ln)
-					if cat is not None:
-						rows.append((cat, cur, ytd))
+				if cat is not None:
+					# Skip totals and meta rows
+					upcat = cat.upper()
+					if any(tok in upcat for tok in _META_TOKENS) or any(tok in upcat for tok in _TOTAL_ROW_TOKENS):
+						continue
+					rows.append((cat, cur, ytd))
 				# If no provider_id yet, try TSV probe on corresponding page image
 				if provider_id is None:
 					# Determine page number from decoded page footer, map to image index
