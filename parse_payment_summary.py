@@ -111,7 +111,6 @@ _NUM_RE = re.compile(r"(-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?)")
 _ONLY_SC_RE = re.compile(r"^[scSC]{2,}$")
 _WORD_RE = re.compile(r"^[A-Za-z][A-Za-z\-']*$")
 _META_TOKENS = ("REPORT", "RUN DATE", "PAGE:", "GROUP #", "REMITTANCE", "FOR PERIOD", "OHIP PAYMENT SUMMARY")
-_TOTAL_ROW_TOKENS = ("GROUP PAYMENTS TO PROVIDER TOTAL", "PROVIDER SUMMARY TOTAL", "PROVIDERS SUMMARY TOTAL")
 
 # Canonical category names (uppercased), with simple normalization to match common OCR variants
 _CATEGORY_CANON = {
@@ -160,6 +159,8 @@ def normalize_category(cat_raw: str) -> str:
 	cat = cat.replace("FEE - FOR - SERVICE", "FEE FOR SERVICE")
 	cat = cat.replace("FEE-FOR-SERVICE", "FEE-FOR-SERVICE")
 	cat = _normalize_spaces(cat)
+	# Drop stray leading 'EE ' artifact that can appear from OCR noise
+	cat = re.sub(r"^EE\s+", "", cat)
 	# Try exact canonical match
 	if cat in _CATEGORY_CANON:
 		return _CATEGORY_CANON[cat]
@@ -167,7 +168,8 @@ def normalize_category(cat_raw: str) -> str:
 	relaxed = cat.replace("-", " ")
 	if relaxed in _CATEGORY_CANON:
 		return _CATEGORY_CANON[relaxed]
-	return cat_raw.strip()
+	# Fallback to the normalized text (not the raw), so upstream cleaning still applies
+	return cat
 
 
 def line_to_category_and_numbers(line: str) -> tuple[str | None, float | None, float | None]:
@@ -271,6 +273,22 @@ def _canon_name_for_match(name: str) -> str:
 	return re.sub(r"\s+", " ", name).strip()
 
 
+def _is_spurious_provider_name(name: str) -> bool:
+	"""
+	Heuristic to detect header/footers accidentally parsed as provider names,
+	e.g., 'Report Id Page of'.
+	Only used to filter rows in provider_payments.csv.
+	"""
+	u = re.sub(r"\s+", " ", name.upper()).strip()
+	# Simple contains-based check
+	if "REPORT" in u and "PAGE" in u and "OF" in u:
+		return True
+	# More specific sequence with optional tokens like 'ID'
+	if re.search(r"\bREPORT\b.*\b(ID|NO|NUMBER)?\b.*\bPAGE\b.*\bOF\b", u):
+		return True
+	return False
+
+
 def extract_provider_name_from_page(page_text: str) -> str:
 	"""
 	Find provider name by scanning lines above 'NETWORK BASE RATE PAYMENT'.
@@ -319,8 +337,6 @@ def parse_provider_page(page_text: str) -> tuple[str, list[tuple[str, float, flo
 			continue
 		# Skip meta/noise
 		if any(k in cat.upper() for k in ("REPORT:", "GROUP #", "RUN DATE", "PAGE:", "BROOKLIN MEDICAL CENTRE", "OHIP PAYMENT SUMMARY", "FOR PERIOD", "REMITTANCE")):
-			continue
-		if any(tok in cat.upper() for tok in _TOTAL_ROW_TOKENS):
 			continue
 		rows.append((cat, cur, ytd))
 	return provider, rows
@@ -384,7 +400,7 @@ def write_provider_csvs_from_entries(provider_entries: List[dict], out_dir: Path
 				total_ytd = sum(r[2] for r in rows)
 			for cat, cur, ytd in rows:
 				# Skip meta categories defensively
-				if any(tok in cat.upper() for tok in _META_TOKENS) or any(tok in cat.upper() for tok in _TOTAL_ROW_TOKENS):
+				if any(tok in cat.upper() for tok in _META_TOKENS):
 					continue
 				wcat.writerow([name, provider_id or "", cat, f"{cur:.2f}", f"{ytd:.2f}"])
 			wtot.writerow([name, provider_id or "", f"{total_cur:.2f}", f"{total_ytd:.2f}"])
@@ -1114,21 +1130,33 @@ def write_provider_payments_csv(meta: dict, provider_entries: List[dict], pages_
 		# First, rows from provider_entries (GROUP PAYMENTS TO PROVIDER)
 		for p in provider_entries:
 			name = p["name"]
+			# Skip spurious header-like names only for provider_payments.csv
+			if _is_spurious_provider_name(name):
+				continue
 			ohip = p.get("id") or ""
 			for cat, cur, ytd in p["rows"]:
 				# Skip meta categories
-				if any(tok in cat.upper() for tok in _META_TOKENS) or any(tok in cat.upper() for tok in _TOTAL_ROW_TOKENS):
+				if any(tok in cat.upper() for tok in _META_TOKENS):
+					continue
+				# Skip this specific total line in provider_payments; keep other totals
+				if "GROUP PAYMENTS TO PROVIDER TOTAL" in cat.upper():
 					continue
 				w.writerow([group_num, period, ab_date or "", f"{(ab_amount or 0.0):.2f}", ohip, name, cat, f"{cur:.2f}", f"{ytd:.2f}", "GROUP PAYMENTS TO PROVIDER"])
 		# Next, decoded PROVIDER SUMMARY pages
 		for p in provider_entries:
 			name = p["name"]
+			# Skip spurious header-like names in summary rows as well
+			if _is_spurious_provider_name(name):
+				continue
 			ohip = p.get("id") or ""
 			# Find summary pages in decoded that include this provider
 			summary_idxs = _find_provider_summary_pages(pages_dec, name)
 			for si in summary_idxs:
 				rows = _iter_provider_section_rows_from_decoded(pages_dec[si], "PROVIDER SUMMARY")
 				for label, cur, ytd in rows:
+					# Only include SPECIAL PREMIUM PAYMENT from PROVIDER SUMMARY
+					if label.upper() != "SPECIAL PREMIUM PAYMENT":
+						continue
 					w.writerow([group_num, period, ab_date or "", f"{(ab_amount or 0.0):.2f}", ohip, name, label, f"{cur:.2f}", f"{ytd:.2f}", "PROVIDER SUMMARY"])
 
 
@@ -1252,12 +1280,8 @@ def main() -> None:
 				rows: List[Tuple[str, float, float]] = []
 				for ln in pages_ocr[i].splitlines():
 					cat, cur, ytd = line_to_category_and_numbers(ln)
-				if cat is not None:
-					# Skip totals and meta rows
-					upcat = cat.upper()
-					if any(tok in upcat for tok in _META_TOKENS) or any(tok in upcat for tok in _TOTAL_ROW_TOKENS):
-						continue
-					rows.append((cat, cur, ytd))
+					if cat is not None:
+						rows.append((cat, cur, ytd))
 				# If no provider_id yet, try TSV probe on corresponding page image
 				if provider_id is None:
 					# Determine page number from decoded page footer, map to image index
