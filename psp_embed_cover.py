@@ -83,9 +83,10 @@ def embed_cover_mp3(mp3_path: Path, cover_bytes: bytes, max_dim: int, quality: i
 		if key.startswith("APIC"):
 			del tags[key]
 	jpg = make_psp_jpeg(cover_bytes, max_dim=max_dim, quality=quality)
-	tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover (front)", data=jpg))
-	# Save as ID3v2.3
-	tags.save(mp3_path, v2_version=3)
+	# ID3v2.3 does not support UTF-8 for text frames; use UTF-16 (encoding=1)
+	tags.add(APIC(encoding=1, mime="image/jpeg", type=3, desc="Cover", data=jpg))
+	# Save as ID3v2.3 and also write an ID3v1 mirror for maximum device compatibility
+	tags.save(mp3_path, v2_version=3, v1=2)
 
 
 def embed_cover_m4a(m4a_path: Path, cover_bytes: bytes, max_dim: int, quality: int) -> None:
